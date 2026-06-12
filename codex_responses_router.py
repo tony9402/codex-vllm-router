@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -10,11 +11,25 @@ from fastapi.responses import Response, StreamingResponse, JSONResponse
 
 app = FastAPI()
 
-UPSTREAM_BASE_URL = os.environ.get("UPSTREAM_BASE_URL", "").rstrip("/")
-API_KEY = os.environ.get("LLM_API_KEY", "")
-API_KEY = API_KEY if API_KEY.startswith("Bearer") else f"Bearer {API_KEY}"
-KEY_HEADER = os.environ.get("LLM_KEY_HEADER", "Authorization")
+UPSTREAM_BASE_URL = os.environ.get("UPSTREAM_BASE_URL", "http://ip:port/v1").rstrip("/")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_API_KEY = LLM_API_KEY if LLM_API_KEY.startswith("Bearer") else f"Bearer {LLM_API_KEY}"
+LLM_KEY_HEADER = os.environ.get("LLM_KEY_HEADER", "Authorization")
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "600"))
+
+# 깨진 pseudo-Codex 출력을 실제 tool call로 복구할지 여부
+ENABLE_CODEX_TEXT_REPAIR = os.environ.get("ENABLE_CODEX_TEXT_REPAIR", "1") not in {
+    "0",
+    "false",
+    "False",
+}
+
+# upstream 모델에 Codex protocol 준수를 강하게 지시할지 여부
+INJECT_CODEX_TOOL_GUARD = os.environ.get("INJECT_CODEX_TOOL_GUARD", "1") not in {
+    "0",
+    "false",
+    "False",
+}
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -27,6 +42,18 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
     "content-length",
 }
+
+
+CODEX_TOOL_GUARD = """You are being used by OpenAI Codex through a protocol adapter.
+
+Critical protocol rules:
+- Do not print or imitate Codex UI markup.
+- Do not output <update_plan>, <|channel>thought, "Shell", "$ command", "실행 완료", "출력 없음", or "성공" as plain text.
+- If a tool is needed, call the provided function tool.
+- If you need to run a shell command, call the shell/command execution tool instead of writing the command in text.
+- If you need to update a plan and an update_plan tool exists, call that tool instead of printing XML or JSON plan text.
+- Never claim that a command was executed unless the tool result is present in the conversation.
+"""
 
 
 def _copy_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -42,14 +69,14 @@ def _upstream_headers(request: Request) -> dict[str, str]:
         "content-type": "application/json",
     }
 
-    incoming_key = request.headers.get(KEY_HEADER)
+    incoming_key = request.headers.get(LLM_KEY_HEADER)
 
     if incoming_key:
-        headers[KEY_HEADER] = incoming_key
-    elif API_KEY:
-        headers[KEY_HEADER] = API_KEY
+        headers[LLM_KEY_HEADER] = incoming_key
+    elif LLM_API_KEY:
+        headers[LLM_KEY_HEADER] = LLM_API_KEY
 
-    # LiteLLM custom header 인증을 쓰는 구조에서는 Authorization을 넣지 않는다.
+    # LiteLLM custom header 인증 구조에서는 Authorization을 일부러 넣지 않는다.
     return headers
 
 
@@ -101,10 +128,6 @@ def normalize_responses_body(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_text_from_responses_content(content: Any) -> str:
-    """
-    Responses API content part list를 Chat Completions용 text로 평탄화한다.
-    Codex에는 보통 input_text/output_text가 들어온다.
-    """
     if content is None:
         return ""
 
@@ -152,22 +175,16 @@ def _stringify_tool_output(output: Any) -> str:
 def _responses_input_to_chat_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
     """
     Responses API input/history를 Chat Completions messages로 변환한다.
-
-    Responses function_call:
-      {"type":"function_call","call_id":"call_x","name":"...","arguments":"{...}"}
-
-    Chat Completions assistant tool call:
-      {"role":"assistant","tool_calls":[
-        {"id":"call_x","type":"function","function":{"name":"...","arguments":"{...}"}}
-      ]}
-
-    Responses function_call_output:
-      {"type":"function_call_output","call_id":"call_x","output":"..."}
-
-    Chat Completions tool result:
-      {"role":"tool","tool_call_id":"call_x","content":"..."}
     """
     messages: list[dict[str, Any]] = []
+
+    if INJECT_CODEX_TOOL_GUARD:
+        messages.append(
+            {
+                "role": "system",
+                "content": CODEX_TOOL_GUARD,
+            }
+        )
 
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
@@ -208,7 +225,6 @@ def _responses_input_to_chat_messages(body: dict[str, Any]) -> list[dict[str, An
         item_type = item.get("type")
         role = item.get("role")
 
-        # OpenAI Responses에서 type 없이 {"role":"user","content":"..."} 형태도 가능하다.
         if item_type in (None, "message") and role in {
             "system",
             "developer",
@@ -218,7 +234,6 @@ def _responses_input_to_chat_messages(body: dict[str, Any]) -> list[dict[str, An
             chat_role = "system" if role == "developer" else role
             content = _extract_text_from_responses_content(item.get("content"))
 
-            # 빈 assistant message는 chat template에 따라 문제를 만들 수 있으므로 생략.
             if chat_role == "assistant" and not content.strip():
                 continue
 
@@ -230,7 +245,6 @@ def _responses_input_to_chat_messages(body: dict[str, Any]) -> list[dict[str, An
             )
             continue
 
-        # 이전 턴에서 모델이 낸 function_call을 Chat Completions history로 복원.
         if item_type == "function_call":
             call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}"
             name = item.get("name") or ""
@@ -248,8 +262,6 @@ def _responses_input_to_chat_messages(body: dict[str, Any]) -> list[dict[str, An
                 },
             }
 
-            # 직전 assistant message가 있으면 그 message에 tool_calls를 붙인다.
-            # 없으면 별도의 assistant tool_calls message를 만든다.
             if messages and messages[-1].get("role") == "assistant":
                 messages[-1].setdefault("tool_calls", [])
                 messages[-1]["tool_calls"].append(tool_call)
@@ -266,7 +278,6 @@ def _responses_input_to_chat_messages(body: dict[str, Any]) -> list[dict[str, An
 
             continue
 
-        # tool 실행 결과를 Chat Completions tool message로 변환.
         if item_type in {"function_call_output", "tool_result"}:
             call_id = item.get("call_id") or item.get("tool_call_id")
             if not call_id:
@@ -282,7 +293,6 @@ def _responses_input_to_chat_messages(body: dict[str, Any]) -> list[dict[str, An
             continue
 
         # reasoning item은 upstream model에 다시 넣지 않는다.
-        # reasoning summary를 일반 text로 주입하면 모델 품질과 보안 양쪽에 악영향이 날 수 있다.
         if item_type == "reasoning":
             continue
 
@@ -292,12 +302,6 @@ def _responses_input_to_chat_messages(body: dict[str, Any]) -> list[dict[str, An
 def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]] | None:
     """
     Responses API tools를 Chat Completions tools로 변환한다.
-
-    Responses function tool:
-      {"type":"function","name":"foo","description":"...","parameters":{...}}
-
-    Chat tool:
-      {"type":"function","function":{"name":"foo","description":"...","parameters":{...}}}
     """
     if not isinstance(tools, list):
         return None
@@ -310,7 +314,6 @@ def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]] | None:
 
         tool_type = tool.get("type")
 
-        # 이미 Chat Completions 형식이면 그대로 통과.
         if tool_type == "function" and isinstance(tool.get("function"), dict):
             chat_tools.append(tool)
             continue
@@ -318,7 +321,6 @@ def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]] | None:
         if tool_type != "function":
             # web_search, file_search, computer_use 같은 built-in Responses tool은
             # vLLM Chat Completions function tool로 직접 변환할 수 없다.
-            # Codex의 local function tool만 여기서 처리한다.
             continue
 
         name = tool.get("name")
@@ -348,22 +350,13 @@ def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]] | None:
 
 
 def _responses_tool_choice_to_chat_tool_choice(tool_choice: Any) -> Any:
-    """
-    Responses tool_choice를 Chat Completions tool_choice로 변환한다.
-    """
     if tool_choice is None:
         return None
 
     if isinstance(tool_choice, str):
-        # auto / none / required
         return tool_choice
 
     if isinstance(tool_choice, dict):
-        # Responses:
-        #   {"type":"function","name":"foo"}
-        #
-        # Chat Completions:
-        #   {"type":"function","function":{"name":"foo"}}
         if tool_choice.get("type") == "function":
             name = tool_choice.get("name")
             if isinstance(name, str) and name:
@@ -378,21 +371,15 @@ def _responses_tool_choice_to_chat_tool_choice(tool_choice: Any) -> Any:
 
 
 def _responses_body_to_chat_body(body: dict[str, Any]) -> dict[str, Any]:
-    """
-    /v1/responses request를 /v1/chat/completions request로 변환한다.
-    """
     messages = _responses_input_to_chat_messages(body)
     tools = _responses_tools_to_chat_tools(body.get("tools"))
 
     chat_body: dict[str, Any] = {
         "model": body.get("model"),
         "messages": messages,
-        # router가 Responses SSE를 직접 합성하기 위해 upstream은 non-stream으로 호출한다.
         "stream": False,
     }
 
-    # Responses API: max_output_tokens
-    # Chat Completions: max_tokens
     if body.get("max_output_tokens") is not None:
         chat_body["max_tokens"] = body["max_output_tokens"]
     elif body.get("max_tokens") is not None:
@@ -445,6 +432,378 @@ def _chat_usage_to_responses_usage(usage: Any) -> dict[str, Any] | None:
     }
 
 
+def _iter_response_function_tools(original_body: dict[str, Any]) -> list[dict[str, Any]]:
+    tools = original_body.get("tools")
+    if not isinstance(tools, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        if tool.get("type") == "function" and isinstance(tool.get("name"), str):
+            result.append(tool)
+            continue
+
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            fn = tool["function"]
+            if isinstance(fn.get("name"), str):
+                result.append(
+                    {
+                        "type": "function",
+                        "name": fn.get("name"),
+                        "description": fn.get("description") or "",
+                        "parameters": fn.get("parameters") or {},
+                    }
+                )
+
+    return result
+
+
+def _find_tool_by_keywords(
+    original_body: dict[str, Any],
+    name_keywords: tuple[str, ...],
+    description_keywords: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    for tool in _iter_response_function_tools(original_body):
+        name = str(tool.get("name") or "").lower()
+        desc = str(tool.get("description") or "").lower()
+
+        if any(keyword in name for keyword in name_keywords):
+            return tool
+
+        if description_keywords and any(keyword in desc for keyword in description_keywords):
+            return tool
+
+    return None
+
+
+def _tool_parameters(tool: dict[str, Any]) -> dict[str, Any]:
+    params = tool.get("parameters")
+
+    if isinstance(params, dict):
+        return params
+
+    fn = tool.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("parameters"), dict):
+        return fn["parameters"]
+
+    return {}
+
+
+def _arguments_for_single_text_tool(tool: dict[str, Any], value: str) -> str:
+    """
+    shell/command류 tool의 parameter schema가 cmd/command/script/input 등 무엇이든
+    가능한 맞춰서 JSON arguments를 만든다.
+    """
+    params = _tool_parameters(tool)
+    props = params.get("properties") if isinstance(params, dict) else None
+    required = params.get("required") if isinstance(params, dict) else None
+
+    if not isinstance(props, dict):
+        return json.dumps({"cmd": value}, ensure_ascii=False)
+
+    preferred_keys = (
+        "cmd",
+        "command",
+        "script",
+        "input",
+        "code",
+        "query",
+        "args",
+    )
+
+    for key in preferred_keys:
+        if key in props:
+            return json.dumps({key: value}, ensure_ascii=False)
+
+    if isinstance(required, list) and required:
+        first_required = required[0]
+        if isinstance(first_required, str):
+            return json.dumps({first_required: value}, ensure_ascii=False)
+
+    if props:
+        first_key = next(iter(props.keys()))
+        return json.dumps({first_key: value}, ensure_ascii=False)
+
+    return json.dumps({"cmd": value}, ensure_ascii=False)
+
+
+def _make_function_call_item(
+    name: str,
+    arguments: str | dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+
+    return {
+        "id": f"fc_{uuid.uuid4().hex}",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": f"call_{uuid.uuid4().hex}",
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+def _strip_codex_pseudo_markup(text: str) -> str:
+    """
+    모델이 평문으로 뱉은 Codex 내부 태그/가짜 shell transcript를 제거한다.
+    복구 가능한 tool call이 없을 때만 visible text fallback에 사용한다.
+    """
+    cleaned = text
+
+    cleaned = re.sub(
+        r"<update_plan>\s*.*?\s*</update_plan>",
+        "",
+        cleaned,
+        flags=re.DOTALL,
+    )
+
+    cleaned = re.sub(
+        r"<\|channel\>.*?(?:<channel\|>|$)",
+        "",
+        cleaned,
+        flags=re.DOTALL,
+    )
+
+    cleaned = re.sub(
+        r"(?ms)^\s*Shell\s*\n\$.*?(?:\n\s*(?:출력 없음|성공)\s*)+",
+        "",
+        cleaned,
+    )
+
+    cleaned = re.sub(
+        r"(?m)^\s*(?:출력 없음|성공|실행 완료)\s*$",
+        "",
+        cleaned,
+    )
+
+    # 빈 줄 정리
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _extract_json_object_maybe(text: str) -> dict[str, Any] | None:
+    text = text.strip()
+
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    except Exception:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        value = json.loads(text[start : end + 1])
+        if isinstance(value, dict):
+            return value
+    except Exception:
+        return None
+
+    return None
+
+
+def _extract_update_plan_calls(
+    text: str,
+    original_body: dict[str, Any],
+) -> list[dict[str, Any]]:
+    update_plan_tool = _find_tool_by_keywords(
+        original_body,
+        name_keywords=("update_plan", "plan"),
+        description_keywords=("plan", "planning"),
+    )
+
+    if not update_plan_tool:
+        return []
+
+    tool_name = update_plan_tool.get("name")
+    if not isinstance(tool_name, str) or not tool_name:
+        return []
+
+    calls: list[dict[str, Any]] = []
+
+    for match in re.finditer(
+        r"<update_plan>\s*(.*?)\s*</update_plan>",
+        text,
+        flags=re.DOTALL,
+    ):
+        inner = match.group(1).strip()
+        parsed = _extract_json_object_maybe(inner)
+
+        if parsed is not None:
+            arguments = parsed
+        else:
+            arguments = {"plan": inner}
+
+        calls.append(_make_function_call_item(tool_name, arguments))
+
+    return calls
+
+
+def _extract_shell_command_from_transcript(text: str) -> str | None:
+    """
+    Gemma가 다음과 같이 가짜 Codex transcript를 출력하는 케이스를 복구한다.
+
+    Shell
+    $mkdir -p ...
+
+    또는
+
+    mkdir -p ... 실행 완료
+
+    또는 heredoc:
+
+    cat << 'EOF' > file.py
+    ...
+    EOF 실행 완료
+    """
+    # 1. Shell transcript의 $ command 라인
+    shell_match = re.search(
+        r"(?ms)^\s*Shell\s*\n\$([^\n]+(?:\n(?!\s*(?:출력 없음|성공|Shell|\$|<\|channel\>)).*)*)",
+        text,
+    )
+    if shell_match:
+        command = shell_match.group(1).strip()
+        if command:
+            return command
+
+    # 2. heredoc command + EOF 실행 완료
+    heredoc_match = re.search(
+        r"(?ms)^((?:cat|tee)\s+.*?<<\s*['\"]?EOF['\"]?.*?^EOF)\s*실행 완료",
+        text,
+    )
+    if heredoc_match:
+        command = heredoc_match.group(1).strip()
+        if command:
+            return command
+
+    # 3. 일반 shell command + 실행 완료
+    command_prefixes = (
+        "mkdir",
+        "cat",
+        "tee",
+        "python",
+        "python3",
+        "pytest",
+        "touch",
+        "ls",
+        "grep",
+        "sed",
+        "awk",
+        "find",
+        "git",
+        "pip",
+        "uvicorn",
+        "rm",
+        "cp",
+        "mv",
+        "chmod",
+        "apply_patch",
+        "echo",
+        "printf",
+    )
+
+    prefix_pattern = "|".join(re.escape(prefix) for prefix in command_prefixes)
+
+    line_match = re.search(
+        rf"(?m)^\s*(({prefix_pattern})\b[^\n]*)\s+실행 완료\s*$",
+        text,
+    )
+    if line_match:
+        command = line_match.group(1).strip()
+        if command:
+            return command
+
+    # 4. 코드블록 안에 shell/bash가 있는 경우
+    fenced_match = re.search(
+        r"(?ms)```(?:bash|sh|shell)\s*\n(.*?)\n```",
+        text,
+    )
+    if fenced_match:
+        command = fenced_match.group(1).strip()
+        if command:
+            return command
+
+    return None
+
+
+def _extract_shell_calls(
+    text: str,
+    original_body: dict[str, Any],
+) -> list[dict[str, Any]]:
+    shell_tool = _find_tool_by_keywords(
+        original_body,
+        name_keywords=(
+            "shell",
+            "bash",
+            "terminal",
+            "command",
+            "exec",
+            "run",
+        ),
+        description_keywords=(
+            "shell",
+            "bash",
+            "terminal",
+            "command",
+            "execute",
+        ),
+    )
+
+    if not shell_tool:
+        return []
+
+    tool_name = shell_tool.get("name")
+    if not isinstance(tool_name, str) or not tool_name:
+        return []
+
+    command = _extract_shell_command_from_transcript(text)
+    if not command:
+        return []
+
+    arguments = _arguments_for_single_text_tool(shell_tool, command)
+    return [_make_function_call_item(tool_name, arguments)]
+
+
+def _repair_codex_pseudo_tool_output(
+    content: str,
+    original_body: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    """
+    upstream이 OpenAI tool_calls를 만들지 못하고 Codex UI 흉내 텍스트를 출력한 경우
+    가능한 부분을 Responses function_call로 복구한다.
+
+    반환:
+    - 복구된 function_call output items
+    - fallback visible text
+    """
+    if not ENABLE_CODEX_TEXT_REPAIR or not isinstance(content, str) or not content.strip():
+        return [], content or ""
+
+    calls: list[dict[str, Any]] = []
+
+    calls.extend(_extract_update_plan_calls(content, original_body))
+    calls.extend(_extract_shell_calls(content, original_body))
+
+    cleaned_text = _strip_codex_pseudo_markup(content)
+
+    # tool call이 복구되면 깨진 일반 텍스트는 Codex에 넘기지 않는다.
+    # Codex는 function_call_output을 받은 뒤 다음 턴에 이어서 진행해야 한다.
+    if calls:
+        return calls, ""
+
+    return [], cleaned_text
+
+
 def _chat_response_to_responses_body(
     chat: dict[str, Any],
     original_body: dict[str, Any],
@@ -465,24 +824,7 @@ def _chat_response_to_responses_body(
 
     output_items: list[dict[str, Any]] = []
 
-    if isinstance(content, str) and content.strip():
-        output_items.append(
-            {
-                "id": f"msg_{uuid.uuid4().hex}",
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": content,
-                        "annotations": [],
-                    }
-                ],
-            }
-        )
-
-    if isinstance(tool_calls, list):
+    if isinstance(tool_calls, list) and tool_calls:
         for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
                 continue
@@ -510,7 +852,39 @@ def _chat_response_to_responses_body(
                 }
             )
 
-    # tool call도 text도 없으면 빈 assistant message를 반환한다.
+        # tool_calls가 있으면 content는 보통 비어 있어야 한다.
+        # 일부 모델이 content도 같이 주는 경우 Codex 혼선을 막기 위해 생략한다.
+        content = ""
+
+    elif isinstance(content, str) and content.strip():
+        repaired_calls, repaired_text = _repair_codex_pseudo_tool_output(
+            content,
+            original_body,
+        )
+
+        if repaired_calls:
+            output_items.extend(repaired_calls)
+            content = ""
+        else:
+            content = repaired_text
+
+    if isinstance(content, str) and content.strip():
+        output_items.append(
+            {
+                "id": f"msg_{uuid.uuid4().hex}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content,
+                        "annotations": [],
+                    }
+                ],
+            }
+        )
+
     if not output_items:
         output_items.append(
             {
@@ -753,7 +1127,6 @@ async def _stream_responses_sse_from_response(response_body: dict[str, Any]):
         },
     )
 
-    # 일부 OpenAI-compatible client는 [DONE] sentinel을 기대한다.
     yield b"data: [DONE]\n\n"
 
 
@@ -821,8 +1194,10 @@ async def health():
     return {
         "ok": True,
         "upstream": UPSTREAM_BASE_URL,
-        "litellm_header": KEY_HEADER,
-        "has_litellm_key": bool(API_KEY),
+        "litellm_header": LLM_KEY_HEADER,
+        "has_llm_key": bool(LLM_API_KEY),
+        "codex_text_repair": ENABLE_CODEX_TEXT_REPAIR,
+        "codex_tool_guard": INJECT_CODEX_TOOL_GUARD,
     }
 
 
@@ -857,12 +1232,9 @@ async def proxy(path: str, request: Request):
             status_code=400,
         )
 
-    # 핵심: Codex의 /v1/responses는 그대로 proxy하지 말고
-    # Chat Completions tools로 변환해서 upstream에 보낸 뒤 다시 Responses 형식으로 반환한다.
     if path == "responses" and isinstance(body, dict):
         return await handle_responses_via_chat_completions(body, request)
 
-    # 그 외 endpoint는 기존처럼 단순 proxy.
     is_stream = isinstance(body, dict) and body.get("stream") is True
 
     if is_stream:
