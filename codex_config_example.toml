@@ -1,0 +1,22 @@
+# 예시 설정 파일 (placeholder 사용)
+
+# 모델 이름 (예: "gpt-4o-mini")
+model = "<your-model-name>"
+
+# 모델 제공자 이름 (예: "vllm")
+model_provider = "<your-provider-name>"
+
+# 제공자 상세 설정
+[model_providers.<your-provider-name>]
+# UI에 표시될 이름
+name = "<Provider Display Name>"  # 예: "vLLM"
+# 업스트림 API 엔드포인트
+base_url = "http://<host>:<port>/v1"  # 예: "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+# 재시도 및 타임아웃 설정 (필요 시 수정)
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 600000
